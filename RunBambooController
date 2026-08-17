@@ -3,11 +3,12 @@
 # Determine the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-SESSION="bamboo"
-eval "$(conda shell.bash hook)"
+SESSION="${BAMBOO_SESSION:-bamboo}"
+LAUNCHER_NAME="${BAMBOO_LAUNCHER_NAME:-$0}"
 
 # Default values
 ROBOT_IP="172.16.0.2"
+ROBOT_MODEL="fr3"
 ROBOT_PORT="5555"
 LISTEN_ADDR="*"
 GRIPPER_DEVICE="/dev/ttyUSB0"
@@ -25,6 +26,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --control_port)
       ROBOT_PORT="$2"
+      shift 2
+      ;;
+    --robot_model)
+      ROBOT_MODEL="$2"
       shift 2
       ;;
     --listen_ip)
@@ -48,7 +53,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --help|-h)
-      echo "Usage: $0 [COMMAND] [OPTIONS]"
+      echo "Usage: $LAUNCHER_NAME [COMMAND] [OPTIONS]"
       echo ""
       echo "Commands:"
       echo "  start     - Start servers (default if no command given and session not running)"
@@ -58,6 +63,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --robot_ip  IP          Robot IP address (default: $ROBOT_IP)"
+      echo "  --robot_model MODEL     Robot model: 'fr3' or 'panda' (default: $ROBOT_MODEL)"
       echo "  --control_port PORT     Control node ZMQ port (default: $ROBOT_PORT)"
       echo "  --listen_ip IP          ZMQ server listen address (default: $LISTEN_ADDR)"
       echo "  --gripper_device DEV    Gripper device if using Robotiq (default: $GRIPPER_DEVICE)"
@@ -67,9 +73,9 @@ while [[ $# -gt 0 ]]; do
       echo "  --help, -h              Show this help"
       echo ""
       echo "Examples:"
-      echo "  $0 start --robot_ip 172.16.0.2 --control_port 5555"
-      echo "  $0 start --gripper_type franka"
-      echo "  $0 start --gripper_type robotiq --gripper_device /dev/ttyUSB1"
+      echo "  $LAUNCHER_NAME start --robot_ip 172.16.0.2 --control_port 5555"
+      echo "  $LAUNCHER_NAME start --gripper_type franka"
+      echo "  $LAUNCHER_NAME start --gripper_type robotiq --gripper_device /dev/ttyUSB1"
       exit 0
       ;;
     start|stop|status|attach)
@@ -111,7 +117,7 @@ fi
 start_servers() {
     # Check if session already exists
     if tmux has-session -t "$SESSION" 2>/dev/null; then
-        echo "❌ Session '$SESSION' already exists. Stop it first with: $0 stop"
+        echo "❌ Session '$SESSION' already exists. Stop it first with: $LAUNCHER_NAME stop"
         return 1
     fi
 
@@ -124,9 +130,14 @@ start_servers() {
         echo "❌ Error: Invalid gripper type '$GRIPPER_TYPE'. Must be 'robotiq' or 'franka'"
         return 1
     fi
+    if [[ "$ROBOT_MODEL" != "fr3" && "$ROBOT_MODEL" != "panda" ]]; then
+        echo "❌ Error: Invalid robot model '$ROBOT_MODEL'. Must be 'fr3' or 'panda'"
+        return 1
+    fi
 
     echo "Starting servers with configuration:"
     echo "  Robot IP: $ROBOT_IP"
+    echo "  Robot model: $ROBOT_MODEL"
     echo "  Control port: $ROBOT_PORT"
     echo "  Listen address: $LISTEN_ADDR"
     echo "  Gripper type: $GRIPPER_TYPE"
@@ -147,9 +158,9 @@ start_servers() {
 
     # Build control node command with gripper type
     if [[ "$GRIPPER_TYPE" == "franka" ]]; then
-        CONTROL_NODE_CMD="cd \"$SCRIPT_DIR/controller/build/\" && LD_LIBRARY_PATH=\"$BAMBOO_LD_PATH\" ./bamboo_control_node -r \"$ROBOT_IP\" -p \"$ROBOT_PORT\" -l \"$LISTEN_ADDR\" -g franka; read"
+        CONTROL_NODE_CMD="cd \"$SCRIPT_DIR/controller/build/\" && LD_LIBRARY_PATH=\"$BAMBOO_LD_PATH\" ./bamboo_control_node -r \"$ROBOT_IP\" -p \"$ROBOT_PORT\" -l \"$LISTEN_ADDR\" -g franka -e \"$ROBOT_MODEL\"; read"
     else
-        CONTROL_NODE_CMD="cd \"$SCRIPT_DIR/controller/build/\" && LD_LIBRARY_PATH=\"$BAMBOO_LD_PATH\" ./bamboo_control_node -r \"$ROBOT_IP\" -p \"$ROBOT_PORT\" -l \"$LISTEN_ADDR\" -g none; read"
+        CONTROL_NODE_CMD="cd \"$SCRIPT_DIR/controller/build/\" && LD_LIBRARY_PATH=\"$BAMBOO_LD_PATH\" ./bamboo_control_node -r \"$ROBOT_IP\" -p \"$ROBOT_PORT\" -l \"$LISTEN_ADDR\" -g none -e \"$ROBOT_MODEL\"; read"
     fi
     tmux new-session -d -s "$SESSION" -n "servers" bash -c "$CONTROL_NODE_CMD"
 
@@ -195,6 +206,7 @@ status_servers() {
     echo "Checking server status..."
     echo "Configuration:"
     echo "  Robot IP: $ROBOT_IP"
+    echo "  Robot model: $ROBOT_MODEL"
     echo "  Control port: $ROBOT_PORT"
     echo "  Listen IP: $LISTEN_ADDR"
     echo "  Gripper type: $GRIPPER_TYPE"
@@ -229,7 +241,7 @@ status_servers() {
         fi
     else
         echo "❌ Session '$SESSION' is not running"
-        echo "   Start with: $0 start"
+        echo "   Start with: $LAUNCHER_NAME start"
     fi
 }
 
@@ -238,7 +250,7 @@ attach_servers() {
         tmux attach -t "$SESSION"
     else
         echo "❌ Session '$SESSION' is not running"
-        echo "   Start with: $0 start"
+        echo "   Start with: $LAUNCHER_NAME start"
     fi
 }
 

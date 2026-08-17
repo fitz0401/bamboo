@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Launch the streaming-capable Bamboo arm controller and its gripper together.
+# The control binary also retains Bamboo's normal trajectory API; this wrapper
+# uses a separate tmux session so teleoperation is easy to identify and manage.
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export BAMBOO_SESSION="bamboo_teleop"
+export BAMBOO_LAUNCHER_NAME="$0"
+
+exec "$SCRIPT_DIR/RunBambooController" "$@"

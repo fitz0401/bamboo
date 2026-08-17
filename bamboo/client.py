@@ -67,6 +67,7 @@ class BambooFrankaClient:
         self.gripper_port = gripper_port
         self.enable_gripper = enable_gripper
         self.gripper_type = gripper_type
+        self._streaming = False
 
         # Validate gripper type
         if gripper_type not in ["robotiq", "franka"]:
@@ -271,6 +272,11 @@ class BambooFrankaClient:
 
     def close(self) -> None:
         """Clean up ZMQ resources."""
+        if getattr(self, "_streaming", False):
+            try:
+                self.stop_streaming()
+            except Exception as e:
+                _log.error(f"Failed to stop stream cleanly; server watchdog will brake the robot: {e}")
         if hasattr(self, "control_socket") and self.control_socket is not None:
             self.control_socket.close()
         if hasattr(self, "gripper_socket") and self.gripper_socket is not None:
@@ -327,6 +333,79 @@ class BambooFrankaClient:
 
         except zmq.Again:
             raise BambooTimeoutError("Timeout waiting for control node response") from None
+
+    def get_capabilities(self) -> dict:
+        """Return capabilities advertised by the control node.
+
+        Older Bamboo servers return an unsuccessful response for this command;
+        callers can use :meth:`supports_streaming` for a boolean check.
+        """
+
+        return self._send_panda_hand_command({"command": "get_capabilities"})
+
+    def supports_streaming(self) -> bool:
+        """Return whether persistent joint-velocity streaming is available."""
+
+        response = self.get_capabilities()
+        return bool(response.get("success", False) and "stream_joint_velocity" in response.get("features", []))
+
+    def start_streaming(
+        self,
+        watchdog_ms: int = 250,
+        max_joint_velocity: float = 0.35,
+        max_joint_acceleration: float = 1.5,
+    ) -> dict:
+        """Start a persistent joint-impedance control session.
+
+        The server ramps velocity commands at ``max_joint_acceleration`` and
+        commands zero velocity if no update arrives within ``watchdog_ms``.
+        Server-side hard limits cap all three values.
+        """
+
+        if not 50 <= watchdog_ms <= 500:
+            raise ValueError("watchdog_ms must be between 50 and 500")
+        if max_joint_velocity <= 0:
+            raise ValueError("max_joint_velocity must be positive")
+        if max_joint_acceleration <= 0:
+            raise ValueError("max_joint_acceleration must be positive")
+        response = self._send_panda_hand_command(
+            {
+                "command": "start_stream",
+                "data": {
+                    "watchdog_ms": watchdog_ms,
+                    "max_joint_velocity": max_joint_velocity,
+                    "max_joint_acceleration": max_joint_acceleration,
+                },
+            }
+        )
+        if response.get("success", False):
+            self._streaming = True
+        return response
+
+    def stream_joint_velocity(self, velocity: np.ndarray | list[float]) -> dict:
+        """Update the seven joint velocities of an active stream, in rad/s."""
+
+        values = np.asarray(velocity, dtype=float)
+        if values.shape != (7,):
+            raise ValueError(f"velocity must have shape (7,), got {values.shape}")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("velocity values must be finite")
+        if not self._streaming:
+            raise RuntimeError("Streaming has not been started by this client")
+        return self._send_panda_hand_command(
+            {
+                "command": "stream_joint_velocity",
+                "data": {"velocity": values.tolist()},
+            }
+        )
+
+    def stop_streaming(self) -> dict:
+        """Ramp an active stream to rest and end its impedance session."""
+
+        response = self._send_panda_hand_command({"command": "stop_stream"}, timeout_ms=5000)
+        if response.get("success", False):
+            self._streaming = False
+        return response
 
     def _send_robotiq_command(self, command: dict) -> dict:
         """Send a command to the gripper server.
@@ -491,7 +570,7 @@ class BambooFrankaClient:
             old_timeout = self.control_socket.getsockopt(zmq.RCVTIMEO)
             self.control_socket.setsockopt(zmq.RCVTIMEO, trajectory_timeout_ms)
             _log.debug(
-                f"Set trajectory timeout to {trajectory_timeout_ms/1000.0:.1f}s for {total_duration:.1f}s trajectory"
+                f"Set trajectory timeout to {trajectory_timeout_ms / 1000.0:.1f}s for {total_duration:.1f}s trajectory"
             )
 
             try:
@@ -645,7 +724,7 @@ def main() -> None:
 
             for i in range(args.samples):
                 result = client.get_joint_states()
-                print(f"Sample {i+1}:")
+                print(f"Sample {i + 1}:")
                 print(f"  Joint positions: {[f'{q:.4f}' for q in result['qpos']]}")
                 print(
                     f"  EE position: [{result['ee_pose'][0][3]:.4f}, "
