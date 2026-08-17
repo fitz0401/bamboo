@@ -85,13 +85,23 @@ pip install -e .[server]
 bash RunBambooController
 ```
 
+For low-latency teleoperation, use the teleoperation launcher. It starts the
+same controller and gripper services in a dedicated `bamboo_teleop` tmux
+session; the control node exposes a persistent velocity-streaming API while
+retaining the normal trajectory API:
+
+```bash
+bash RunTeleopController
+```
+
 The script supports configuration flags:
 ```bash
-bash RunBambooController start --robot_ip 172.16.0.2 --control_port 5555 --listen_ip "*" --gripper_type robotiq --gripper_device /dev/ttyUSB0 --gripper_port 5559 --conda_env bamboo
+bash RunBambooController start --robot_ip 172.16.0.2 --robot_model fr3 --control_port 5555 --listen_ip "*" --gripper_type robotiq --gripper_device /dev/ttyUSB0 --gripper_port 5559 --conda_env bamboo
 ```
 
 Available options:
 - `--robot_ip`: Robot IP address (default: 172.16.0.2)
+- `--robot_model`: Robot model used for streaming joint limits: `fr3` or `panda` (default: fr3)
 - `--control_port`: Control node ZMQ port (default: 5555)
 - `--listen_ip`: ZMQ server listen address (default: * for all interfaces)
 - `--gripper_type`: Gripper type: `robotiq` or `franka` (default: robotiq). Use `franka` when using the built-in Franka Hand — the gripper is then managed directly by the C++ control node with no separate gripper server needed.
@@ -103,6 +113,56 @@ Other commands:
 - `bash RunBambooController status` - Check server status
 - `bash RunBambooController stop` - Stop all servers
 - `bash RunBambooController attach` - Attach to tmux session
+
+`RunTeleopController` accepts the same commands and options:
+
+- `bash RunTeleopController status`
+- `bash RunTeleopController attach`
+- `bash RunTeleopController stop`
+
+### Persistent control for teleoperation
+
+The normal `execute_joint_impedance_path` call blocks until its trajectory has
+finished and the arm has stopped. That behavior is appropriate for planned
+motions, but repeated short paths feel stop-and-go during teleoperation. The
+streaming API keeps one libfranka impedance session alive and updates joint
+velocity targets without restarting the real-time control loop.
+
+```python
+import time
+
+import numpy as np
+
+from bamboo import BambooFrankaClient
+
+with BambooFrankaClient(server_ip="172.16.0.20", enable_gripper=False) as robot:
+    assert robot.supports_streaming()
+    result = robot.start_streaming(
+        watchdog_ms=250,
+        max_joint_velocity=0.35,
+        max_joint_acceleration=1.5,
+    )
+    if not result["success"]:
+        raise RuntimeError(result["error"])
+
+    try:
+        for _ in range(30):  # update at approximately 30 Hz
+            robot.stream_joint_velocity(np.zeros(7))
+            time.sleep(1 / 30)
+    finally:
+        robot.stop_streaming()
+```
+
+The client should continuously send seven joint velocities in rad/s. The
+controller ramps changes using the negotiated acceleration limit, enforces the
+FR3 joint limits and a maximum reference tracking error, and rate-limits torque
+commands. A controller-side watchdog commands zero velocity if updates stop;
+`watchdog_ms` is restricted to 50–500 ms. `stop_streaming()` ramps to rest before
+ending the control session.
+
+Only one control mode can own the robot at a time. Stop streaming before sending
+a planned trajectory. A software watchdog is not a replacement for the robot's
+physical E-stop.
 
 **Manual Start:** If you need to run servers manually, first run the C++ control node:
 

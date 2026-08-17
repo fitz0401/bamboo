@@ -1,9 +1,11 @@
 // Joint Impedance control
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdint>
 #include <exception>
 #include <getopt.h>
 #include <iomanip>
@@ -55,10 +57,39 @@ std::exception_ptr getThreadException() {
   return thread_exception_ptr;
 }
 
+namespace {
+
+using Vector7d = Eigen::Matrix<double, 7, 1>;
+using SteadyClock = std::chrono::steady_clock;
+
+static_assert(std::atomic<double>::is_always_lock_free,
+              "Streaming control requires lock-free double atomics");
+
+constexpr std::array<double, 7> kFr3JointLower = {
+    -2.9007, -1.8361, -2.9007, -3.0770, -2.8763, 0.4398, -3.0508};
+constexpr std::array<double, 7> kFr3JointUpper = {
+    2.9007, 1.8361, 2.9007, -0.1169, 2.8763, 4.6216, 3.0508};
+constexpr std::array<double, 7> kPandaJointLower = {
+    -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
+constexpr std::array<double, 7> kPandaJointUpper = {
+    2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973};
+constexpr double kJointMargin = 0.08;
+constexpr double kHardMaxStreamVelocity = 0.50;
+constexpr double kHardMaxStreamAcceleration = 2.0;
+constexpr int kHardMaxWatchdogMs = 500;
+constexpr double kMaxTrackingError = 0.03;
+
+int64_t steadyNowNanoseconds() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             SteadyClock::now().time_since_epoch())
+      .count();
+}
+
+} // namespace
+
 // Signal handler for graceful shutdown
 void signalHandler(int signal) {
-  if (signal == SIGINT) {
-    std::cout << "\nReceived Ctrl+C, shutting down gracefully..." << std::endl;
+  if (signal == SIGINT || signal == SIGTERM || signal == SIGHUP) {
     global_shutdown = true;
   }
 }
@@ -74,6 +105,29 @@ private:
 
   std::atomic<bool> control_running_{false};
   std::atomic<bool> joint_limit_hit_{false};
+  const std::array<double, 7> joint_lower_;
+  const std::array<double, 7> joint_upper_;
+
+  // Persistent streaming control state. All callback-shared values are atomic
+  // so the 1 kHz real-time loop never waits on the ZMQ thread.
+  std::array<std::atomic<double>, 7> stream_target_velocity_;
+  std::array<std::atomic<double>, 7> state_q_;
+  std::array<std::atomic<double>, 7> state_dq_;
+  std::array<std::atomic<double>, 7> state_tau_;
+  std::array<std::atomic<double>, 16> state_pose_;
+  std::atomic<double> state_time_{0.0};
+  std::atomic<int64_t> stream_last_update_ns_{0};
+  std::atomic<int64_t> stream_stop_request_ns_{0};
+  std::atomic<bool> stream_running_{false};
+  std::atomic<bool> stream_ready_{false};
+  std::atomic<bool> stream_stop_requested_{false};
+  std::atomic<bool> stream_failed_{false};
+  std::thread stream_thread_;
+  std::mutex stream_error_mutex_;
+  std::string stream_error_message_;
+  int stream_watchdog_ms_{250};
+  double stream_max_velocity_{0.35};
+  double stream_max_acceleration_{1.5};
 
   // Control parameters
   const int traj_rate_ = 500; // Hz
@@ -94,27 +148,45 @@ public:
   BambooControlServer(franka::Robot *robot, franka::Model *model,
                       franka::Gripper *gripper,
                       bamboo::controllers::JointImpedanceController *controller,
-                      bamboo::interpolators::JointInterpolator *interpolator)
+                      bamboo::interpolators::JointInterpolator *interpolator,
+                      const std::array<double, 7> &joint_lower,
+                      const std::array<double, 7> &joint_upper)
       : robot_(robot), model_(model), gripper_(gripper),
-        controller_(controller), interpolator_(interpolator) {
+        controller_(controller), interpolator_(interpolator),
+        joint_lower_(joint_lower), joint_upper_(joint_upper) {
 
     // Get initial robot state
     franka::RobotState init_state = robot_->readOnce();
+    cacheRobotState(init_state);
     q_current_ = Eigen::VectorXd::Map(init_state.q.data(), 7);
     q_goal_ = q_current_;
 
     // Initialize velocity and acceleration tracking
     velocity_cmd_prev_.setZero();
     a_cmd_latest_.setZero();
+    for (auto &value : stream_target_velocity_) {
+      value.store(0.0);
+    }
 
     std::cout << "Initial joint positions: " << q_current_.transpose()
               << std::endl;
   }
 
+  ~BambooControlServer() {
+    try {
+      StopStreaming();
+    } catch (const std::exception &e) {
+      std::cerr << "[STREAM] Error during shutdown: " << e.what() << std::endl;
+    }
+  }
+
   bamboo_msgs::RobotState GetRobotState() {
     try {
-      // Get current robot state
-      franka::RobotState current_state = robot_->readOnce();
+      // readOnce cannot run concurrently with robot.control(). During a stream,
+      // return the lock-free state cache populated by the control callback.
+      if (!stream_running_.load()) {
+        cacheRobotState(robot_->readOnce());
+      }
 
       bamboo_msgs::RobotState state_msg;
 
@@ -123,19 +195,19 @@ public:
       state_msg.dq.resize(7);
       state_msg.tau_J.resize(7);
       for (size_t i = 0; i < 7; ++i) {
-        state_msg.q[i] = current_state.q[i];
-        state_msg.dq[i] = current_state.dq[i];
-        state_msg.tau_J[i] = current_state.tau_J[i];
+        state_msg.q[i] = state_q_[i].load();
+        state_msg.dq[i] = state_dq_[i].load();
+        state_msg.tau_J[i] = state_tau_[i].load();
       }
 
       // Add end-effector pose (4x4 transformation matrix: O_T_EE)
       state_msg.O_T_EE.resize(16);
       for (size_t i = 0; i < 16; ++i) {
-        state_msg.O_T_EE[i] = current_state.O_T_EE[i];
+        state_msg.O_T_EE[i] = state_pose_[i].load();
       }
 
       // Add timing information
-      state_msg.time_sec = current_state.time.toSec();
+      state_msg.time_sec = state_time_.load();
 
       return state_msg;
     } catch (const franka::Exception &e) {
@@ -143,6 +215,103 @@ public:
     } catch (const std::exception &e) {
       throw std::runtime_error(std::string("Exception: ") + e.what());
     }
+  }
+
+  void StartStreaming(int watchdog_ms, double max_velocity,
+                      double max_acceleration) {
+    if (stream_running_.load()) {
+      // Reconnecting clients always inherit a stopped stream.
+      SetStreamVelocity(std::vector<double>(7, 0.0));
+      return;
+    }
+    if (control_running_.load()) {
+      throw std::runtime_error("Another control loop is already running");
+    }
+    if (stream_thread_.joinable()) {
+      stream_thread_.join();
+    }
+
+    stream_watchdog_ms_ = std::clamp(watchdog_ms, 50, kHardMaxWatchdogMs);
+    stream_max_velocity_ =
+        std::clamp(max_velocity, 0.01, kHardMaxStreamVelocity);
+    stream_max_acceleration_ =
+        std::clamp(max_acceleration, 0.05, kHardMaxStreamAcceleration);
+
+    const franka::RobotState initial_state = robot_->readOnce();
+    cacheRobotState(initial_state);
+    q_current_ = Eigen::Map<const Vector7d>(initial_state.q.data());
+    q_goal_ = q_current_;
+    for (auto &value : stream_target_velocity_) {
+      value.store(0.0);
+    }
+    stream_last_update_ns_.store(steadyNowNanoseconds());
+    stream_stop_request_ns_.store(0);
+    stream_stop_requested_.store(false);
+    stream_failed_.store(false);
+    stream_ready_.store(false);
+    setStreamError("");
+    control_running_.store(true);
+    stream_running_.store(true);
+    stream_thread_ = std::thread(&BambooControlServer::streamControlLoop, this);
+
+    const auto deadline = SteadyClock::now() + std::chrono::seconds(2);
+    while (!stream_ready_.load() && stream_running_.load() &&
+           SteadyClock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!stream_ready_.load()) {
+      stream_stop_requested_.store(true);
+      if (stream_thread_.joinable()) {
+        stream_thread_.join();
+      }
+      const std::string message = getStreamError();
+      throw std::runtime_error(message.empty() ? "Stream failed to start"
+                                               : message);
+    }
+    std::cout << "[STREAM] Started (watchdog=" << stream_watchdog_ms_
+              << " ms, max_velocity=" << stream_max_velocity_
+              << " rad/s, max_acceleration=" << stream_max_acceleration_
+              << " rad/s^2)" << std::endl;
+  }
+
+  void SetStreamVelocity(const std::vector<double> &velocity) {
+    if (!stream_running_.load() || !stream_ready_.load()) {
+      throw std::runtime_error("Streaming control is not running");
+    }
+    if (velocity.size() != 7) {
+      throw std::runtime_error("Velocity must contain seven values");
+    }
+    for (size_t i = 0; i < velocity.size(); ++i) {
+      if (!std::isfinite(velocity[i])) {
+        throw std::runtime_error("Velocity values must be finite");
+      }
+      if (std::abs(velocity[i]) > stream_max_velocity_ + 1e-9) {
+        throw std::runtime_error("Velocity exceeds negotiated stream limit");
+      }
+    }
+    for (size_t i = 0; i < velocity.size(); ++i) {
+      stream_target_velocity_[i].store(velocity[i]);
+    }
+    stream_last_update_ns_.store(steadyNowNanoseconds());
+  }
+
+  void StopStreaming() {
+    if (!stream_running_.load() && !stream_thread_.joinable()) {
+      return;
+    }
+    for (auto &value : stream_target_velocity_) {
+      value.store(0.0);
+    }
+    stream_last_update_ns_.store(steadyNowNanoseconds());
+    stream_stop_request_ns_.store(steadyNowNanoseconds());
+    stream_stop_requested_.store(true);
+    if (stream_thread_.joinable()) {
+      stream_thread_.join();
+    }
+    if (stream_failed_.load()) {
+      throw std::runtime_error(getStreamError());
+    }
+    std::cout << "[STREAM] Stopped" << std::endl;
   }
 
   bool ExecuteJointImpedanceTrajectory(
@@ -318,6 +487,122 @@ public:
   }
 
 private:
+  void cacheRobotState(const franka::RobotState &state) {
+    for (size_t i = 0; i < 7; ++i) {
+      state_q_[i].store(state.q[i], std::memory_order_relaxed);
+      state_dq_[i].store(state.dq[i], std::memory_order_relaxed);
+      state_tau_[i].store(state.tau_J[i], std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < 16; ++i) {
+      state_pose_[i].store(state.O_T_EE[i], std::memory_order_relaxed);
+    }
+    state_time_.store(state.time.toSec(), std::memory_order_relaxed);
+  }
+
+  void setStreamError(const std::string &message) {
+    std::lock_guard<std::mutex> lock(stream_error_mutex_);
+    stream_error_message_ = message;
+  }
+
+  std::string getStreamError() {
+    std::lock_guard<std::mutex> lock(stream_error_mutex_);
+    return stream_error_message_;
+  }
+
+  void streamControlLoop() {
+    try {
+      Vector7d desired_position;
+      Vector7d desired_velocity = Vector7d::Zero();
+      for (size_t i = 0; i < 7; ++i) {
+        desired_position[static_cast<int>(i)] = state_q_[i].load();
+      }
+      controller_->RestoreDefaultGains();
+      stream_ready_.store(true);
+
+      auto control_callback = [&](const franka::RobotState &robot_state,
+                                  franka::Duration period) -> franka::Torques {
+        cacheRobotState(robot_state);
+        q_current_ = Eigen::Map<const Vector7d>(robot_state.q.data());
+        const double dt = std::clamp(period.toSec(), 0.0001, 0.01);
+        Vector7d requested_velocity;
+        const int64_t command_age_ns =
+            steadyNowNanoseconds() - stream_last_update_ns_.load();
+        const bool watchdog_expired =
+            command_age_ns >
+            static_cast<int64_t>(stream_watchdog_ms_) * 1000000;
+        const bool ending =
+            stream_stop_requested_.load() || global_shutdown.load();
+        if (ending && stream_stop_request_ns_.load() == 0) {
+          int64_t expected = 0;
+          stream_stop_request_ns_.compare_exchange_strong(
+              expected, steadyNowNanoseconds());
+        }
+
+        for (size_t i = 0; i < 7; ++i) {
+          requested_velocity[static_cast<int>(i)] =
+              (watchdog_expired || ending) ? 0.0
+                                           : stream_target_velocity_[i].load();
+        }
+
+        const double max_velocity_delta = stream_max_acceleration_ * dt;
+        for (int i = 0; i < 7; ++i) {
+          const double difference = requested_velocity[i] - desired_velocity[i];
+          desired_velocity[i] +=
+              std::clamp(difference, -max_velocity_delta, max_velocity_delta);
+
+          const double next = desired_position[i] + desired_velocity[i] * dt;
+          const double lower = joint_lower_[i] + kJointMargin;
+          const double upper = joint_upper_[i] - kJointMargin;
+          if (next < lower || next > upper) {
+            desired_velocity[i] = 0.0;
+            desired_position[i] = std::clamp(next, lower, upper);
+          } else {
+            desired_position[i] = next;
+          }
+
+          // Bound reference wind-up if contact prevents target tracking.
+          desired_position[i] = std::clamp(
+              desired_position[i], robot_state.q[i] - kMaxTrackingError,
+              robot_state.q[i] + kMaxTrackingError);
+        }
+
+        const bamboo::controllers::ControllerResult result = controller_->Step(
+            robot_state, desired_position, desired_velocity, Vector7d::Zero());
+        const std::array<double, 7> torques = franka::limitRate(
+            franka::kMaxTorqueRate, result.torques, robot_state.tau_J_d);
+        if (result.torque_limit_violated) {
+          stream_failed_.store(true);
+          setStreamError("Torque limit reached during streaming control");
+          return franka::MotionFinished(franka::Torques(torques));
+        }
+
+        const Vector7d measured_velocity =
+            Eigen::Map<const Vector7d>(robot_state.dq.data());
+        const double stop_age_seconds =
+            static_cast<double>(steadyNowNanoseconds() -
+                                stream_stop_request_ns_.load()) /
+            1e9;
+        if (ending && desired_velocity.norm() < 1e-4 &&
+            (measured_velocity.norm() < 0.01 || stop_age_seconds > 2.0)) {
+          return franka::MotionFinished(franka::Torques(torques));
+        }
+        return franka::Torques(torques);
+      };
+
+      robot_->control(control_callback);
+    } catch (const franka::Exception &e) {
+      stream_failed_.store(true);
+      setStreamError(std::string("Franka streaming control error: ") +
+                     e.what());
+    } catch (const std::exception &e) {
+      stream_failed_.store(true);
+      setStreamError(std::string("Streaming control error: ") + e.what());
+    }
+    stream_ready_.store(false);
+    stream_running_.store(false);
+    control_running_.store(false);
+  }
+
   bool executeTrajectory(
       const std::vector<Eigen::Matrix<double, 7, 1>> &goals,
       const std::vector<Eigen::Matrix<double, 7, 1>> &velocities,
@@ -643,14 +928,95 @@ private:
 };
 
 // Message parsing helpers
-std::string
-parseCommand(const std::map<std::string, msgpack::object> &request_map) {
+using RequestMap = std::map<std::string, msgpack::object>;
+
+template <typename T>
+T valueOr(const RequestMap &values, const std::string &key, const T &fallback) {
+  const auto it = values.find(key);
+  if (it == values.end()) {
+    return fallback;
+  }
+  T value;
+  it->second.convert(value);
+  return value;
+}
+
+RequestMap getRequestData(const RequestMap &request_map) {
+  const auto it = request_map.find("data");
+  if (it == request_map.end()) {
+    return {};
+  }
+  RequestMap data;
+  it->second.convert(data);
+  return data;
+}
+
+std::string parseCommand(const RequestMap &request_map) {
   std::string command;
   auto it = request_map.find("command");
   if (it != request_map.end()) {
     it->second.convert(command);
   }
   return command;
+}
+
+msgpack::sbuffer handleGetCapabilities() {
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(3);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("protocol_version");
+  packer.pack(1);
+  packer.pack("features");
+  packer.pack(std::vector<std::string>{"stream_joint_velocity",
+                                       "cached_robot_state", "watchdog"});
+  return response_buf;
+}
+
+msgpack::sbuffer handleStartStream(BambooControlServer &server,
+                                   const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  server.StartStreaming(valueOr<int>(data, "watchdog_ms", 250),
+                        valueOr<double>(data, "max_joint_velocity", 0.35),
+                        valueOr<double>(data, "max_joint_acceleration", 1.5));
+
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(2);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  return response_buf;
+}
+
+msgpack::sbuffer handleStreamJointVelocity(BambooControlServer &server,
+                                           const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  server.SetStreamVelocity(valueOr<std::vector<double>>(data, "velocity", {}));
+
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(2);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  return response_buf;
+}
+
+msgpack::sbuffer handleStopStream(BambooControlServer &server) {
+  server.StopStreaming();
+
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(2);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  return response_buf;
 }
 
 msgpack::sbuffer handleGetRobotState(BambooControlServer &server) {
@@ -817,9 +1183,12 @@ msgpack::sbuffer handleError(const std::string &error_msg) {
 void RunServer(const std::string &server_address, franka::Robot *robot,
                franka::Model *model, franka::Gripper *gripper,
                bamboo::controllers::JointImpedanceController *controller,
-               bamboo::interpolators::JointInterpolator *interpolator) {
+               bamboo::interpolators::JointInterpolator *interpolator,
+               const std::array<double, 7> &joint_lower,
+               const std::array<double, 7> &joint_upper) {
 
-  BambooControlServer server(robot, model, gripper, controller, interpolator);
+  BambooControlServer server(robot, model, gripper, controller, interpolator,
+                             joint_lower, joint_upper);
 
   // Create context and socket
   zmq::context_t context(1);
@@ -859,8 +1228,16 @@ void RunServer(const std::string &server_address, franka::Robot *robot,
       msgpack::sbuffer response_buf;
 
       try {
-        if (command == "get_robot_state") {
+        if (command == "get_capabilities") {
+          response_buf = handleGetCapabilities();
+        } else if (command == "get_robot_state") {
           response_buf = handleGetRobotState(server);
+        } else if (command == "start_stream") {
+          response_buf = handleStartStream(server, request_map);
+        } else if (command == "stream_joint_velocity") {
+          response_buf = handleStreamJointVelocity(server, request_map);
+        } else if (command == "stop_stream") {
+          response_buf = handleStopStream(server);
         } else if (command == "execute_trajectory") {
           response_buf = handleExecuteTrajectory(server, request_map);
         } else if (command == "open_gripper") {
@@ -908,15 +1285,18 @@ void RunServer(const std::string &server_address, franka::Robot *robot,
 int main(int argc, char **argv) {
   // Register signal handler for graceful shutdown
   std::signal(SIGINT, signalHandler);
+  std::signal(SIGTERM, signalHandler);
+  std::signal(SIGHUP, signalHandler);
 
   std::string robot_ip;
   std::string port;
   std::string listen_address = "*";  // default
   std::string gripper_type = "none"; // default: no gripper control in C++ node
+  std::string robot_model = "fr3";
   bool use_min_jerk = false;
 
   int opt;
-  while ((opt = getopt(argc, argv, "r:p:l:g:mh")) != -1) {
+  while ((opt = getopt(argc, argv, "r:p:l:g:e:mh")) != -1) {
     switch (opt) {
     case 'r':
       robot_ip = optarg;
@@ -930,6 +1310,9 @@ int main(int argc, char **argv) {
     case 'g':
       gripper_type = optarg;
       break;
+    case 'e':
+      robot_model = optarg;
+      break;
     case 'm':
       use_min_jerk = true;
       break;
@@ -938,13 +1321,15 @@ int main(int argc, char **argv) {
     default:
       std::cerr << "Usage: " << argv[0]
                 << " -r <robot-ip> -p <port> [-l <listen-address>] [-g "
-                   "<gripper-type>] [-m]"
+                   "<gripper-type>] [-e <fr3|panda>] [-m]"
                 << std::endl;
       std::cerr << "  -r: Robot IP address (required)" << std::endl;
       std::cerr << "  -p: Port number (required)" << std::endl;
       std::cerr << "  -l: Listen address (default: * for all interfaces)"
                 << std::endl;
       std::cerr << "  -g: Gripper type: 'franka' or 'none' (default: none)"
+                << std::endl;
+      std::cerr << "  -e: Robot model: 'fr3' or 'panda' (default: fr3)"
                 << std::endl;
       std::cerr << "  -m: Use min-jerk interpolation (default: linear)"
                 << std::endl;
@@ -958,7 +1343,7 @@ int main(int argc, char **argv) {
     std::cerr << "Error: Robot IP and port are required" << std::endl;
     std::cerr << "Usage: " << argv[0]
               << " -r <robot-ip> -p <port> [-l <listen-address>] [-g "
-                 "<gripper-type>] [-m]"
+                 "<gripper-type>] [-e <fr3|panda>] [-m]"
               << std::endl;
     return -1;
   }
@@ -969,6 +1354,11 @@ int main(int argc, char **argv) {
               << "'. Must be 'franka' or 'none'" << std::endl;
     return -1;
   }
+  if (robot_model != "fr3" && robot_model != "panda") {
+    std::cerr << "Error: Invalid robot model '" << robot_model
+              << "'. Must be 'fr3' or 'panda'" << std::endl;
+    return -1;
+  }
 
   const std::string server_address = "tcp://" + listen_address + ":" + port;
 
@@ -977,6 +1367,7 @@ int main(int argc, char **argv) {
   std::cout << "Port: " << port << std::endl;
   std::cout << "Listen address: " << listen_address << std::endl;
   std::cout << "Gripper type: " << gripper_type << std::endl;
+  std::cout << "Robot model: " << robot_model << std::endl;
 
   try {
     // Connect to robot
@@ -1020,8 +1411,12 @@ int main(int argc, char **argv) {
     bamboo::interpolators::JointInterpolator interpolator(interp_type);
 
     // Start server
+    const auto &joint_lower =
+        robot_model == "fr3" ? kFr3JointLower : kPandaJointLower;
+    const auto &joint_upper =
+        robot_model == "fr3" ? kFr3JointUpper : kPandaJointUpper;
     RunServer(server_address, &robot, &model, gripper_ptr, &controller,
-              &interpolator);
+              &interpolator, joint_lower, joint_upper);
 
     std::cout << "Control node terminated successfully" << std::endl;
 
